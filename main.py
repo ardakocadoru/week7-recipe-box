@@ -11,11 +11,13 @@ Test:
     pytest
 """
 import json
+import re
 import sqlite3
 from contextlib import closing
+from fractions import Fraction
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -122,3 +124,74 @@ def toggle_favorite(recipe_id: int):
     if row is None:
         raise HTTPException(status_code=404, detail="unknown recipe")
     return _row_to_recipe(row)
+
+
+# A leading quantity: mixed number ("1 1/2"), fraction ("1/2"), decimal ("1.5") or
+# integer ("200"). The lookahead stops partial matches such as "2" in "2-3 eggs" or
+# "1" in "1/0 cup", so anything we cannot read fully is left untouched.
+_QUANTITY = re.compile(
+    r"^(?P<lead>\s*)"
+    r"(?:(?P<whole>\d{1,9})\s+(?P<num>\d{1,9})/(?P<den>\d{1,9})"
+    r"|(?P<frac_num>\d{1,9})/(?P<frac_den>\d{1,9})"
+    r"|(?P<number>\d{1,9}(?:\.\d{1,9})?))"
+    r"(?![\d./-])"
+)
+
+
+def _parse_quantity(match: re.Match) -> tuple[Fraction, bool] | None:
+    """Return (value, written_as_fraction), or None for a zero denominator."""
+    if match["number"] is not None:
+        return Fraction(match["number"]), False
+    if match["whole"] is not None:
+        whole, num, den = int(match["whole"]), int(match["num"]), int(match["den"])
+    else:
+        whole, num, den = 0, int(match["frac_num"]), int(match["frac_den"])
+    if den == 0:
+        return None
+    return whole + Fraction(num, den), True
+
+
+def _format_quantity(value: Fraction, as_fraction: bool) -> str:
+    """Readable quantity: "400", "1 1/2" (for fraction inputs) or "2.25"."""
+    if value.denominator == 1:
+        return str(value.numerator)
+    if as_fraction and value.denominator <= 16:
+        whole, rest = divmod(value.numerator, value.denominator)
+        frac = f"{rest}/{value.denominator}"
+        return f"{whole} {frac}" if whole else frac
+    # Round to two decimals with exact integer arithmetic (no float overflow or noise).
+    whole, cents = divmod(round(value * 100), 100)
+    if whole == 0 and cents == 0:
+        # Would round to "0"; keep a few significant digits instead.
+        return f"{float(value):.3g}"
+    return f"{whole}.{cents:02d}".rstrip("0").rstrip(".")
+
+
+def scale_ingredient(ingredient: str, factor: Fraction) -> str:
+    """Multiply the leading quantity of an ingredient line by factor.
+
+    Lines without a readable leading quantity ("salt to taste") are returned as is.
+    """
+    match = _QUANTITY.match(ingredient)
+    if match is None:
+        return ingredient
+    parsed = _parse_quantity(match)
+    if parsed is None:
+        return ingredient
+    value, as_fraction = parsed
+    scaled = _format_quantity(value * factor, as_fraction)
+    return match["lead"] + scaled + ingredient[match.end():]
+
+
+@app.get("/recipes/{recipe_id}/scaled")
+def get_scaled_recipe(
+    recipe_id: int,
+    factor: float = Query(gt=0, allow_inf_nan=False),
+):
+    recipe = get_recipe(recipe_id)
+    # repr() gives the shortest decimal for the float, so 0.1 becomes exactly 1/10.
+    exact_factor = Fraction(repr(factor))
+    recipe["ingredients"] = [
+        scale_ingredient(item, exact_factor) for item in recipe["ingredients"]
+    ]
+    return recipe
