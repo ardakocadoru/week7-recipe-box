@@ -39,7 +39,18 @@ def test_filtered_results_have_full_recipe_shape():
     tag = f"shape-{uuid4().hex}"
     rid = _create("Waffles", [tag, "sweet"])
     body = client.get("/recipes", params={"tag": tag}).json()
-    assert body == [{"id": rid, "title": "Waffles", "ingredients": [], "tags": [tag, "sweet"]}]
+    assert body == [
+        {"id": rid, "title": "Waffles", "ingredients": [], "tags": [tag, "sweet"], "favorite": False}
+    ]
+
+
+def test_filtered_results_reflect_favorite_toggle():
+    # Integration check after merging task-a (tag filter) with task-b (favorites).
+    tag = f"fav-{uuid4().hex}"
+    rid = _create("Shakshuka", [tag])
+    client.post(f"/recipes/{rid}/favorite")
+    body = client.get("/recipes", params={"tag": tag}).json()
+    assert [(r["id"], r["favorite"]) for r in body] == [(rid, True)]
 
 
 def test_query_is_case_insensitive_and_trimmed():
