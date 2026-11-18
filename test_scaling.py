@@ -357,3 +357,100 @@ def test_scaled_endpoint_handles_round_2_inputs():
     ]
     same = client.get(f"/recipes/{rec['id']}/scaled", params={"factor": 1}).json()
     assert same["ingredients"] == lines
+
+
+# --- round-3 critique: general unit, pack-size and second-amount rules -------
+
+
+@pytest.mark.parametrize(
+    "ingredient, factor, expected",
+    [
+        # critique inputs
+        ("1 8-oz package cream cheese", 2, "2 8-oz package cream cheese"),
+        ("2 15-ounce cans black beans", 2, "4 15-ounce cans black beans"),
+        ("2 15-ounce cans black beans", Fraction(1, 2), "1 15-ounce cans black beans"),
+        ("1 28 oz can tomatoes", 2, "2 28 oz can tomatoes"),
+        ("2 400 g tins chickpeas", 2, "4 400 g tins chickpeas"),
+        ("2 14.5-ounce cans", 2, "4 14.5-ounce cans"),
+        # spellings the critique did not list
+        ("1 10-oz. bag spinach", 2, "2 10-oz. bag spinach"),
+        ("3 1-lb packages", 2, "6 1-lb packages"),
+        ("1 750 ml bottle wine", 2, "2 750 ml bottle wine"),
+        ("2 1.5-litre bottles", 2, "4 1.5-litre bottles"),
+        ('1 12" pizza base', 2, '2 12" pizza base'),
+        ("1 9-in. crust", 2, "2 9-in. crust"),
+        # the size's equivalent in brackets belongs to the size, so it stays too
+        ("1 28 oz can (800 g) tomatoes", 2, "2 28 oz can (800 g) tomatoes"),
+        # a pack size we can read only partly leaves the line alone
+        ("1 14,5-oz can", 2, "1 14,5-oz can"),
+    ],
+)
+def test_pack_size_after_count_is_kept(ingredient, factor, expected):
+    assert scale_ingredient(ingredient, Fraction(factor)) == expected
+
+
+@pytest.mark.parametrize(
+    "ingredient, expected",
+    [
+        # critique inputs
+        ("12 oz. (340 g) chocolate chips", "24 oz. (680 g) chocolate chips"),
+        ("2 tbsp. (30 ml) oil", "4 tbsp. (60 ml) oil"),
+        ("1 lb. 2 oz. beef", "2 lb. 4 oz. beef"),
+        ("1 cup (2 sticks) butter", "2 cup (4 sticks) butter"),
+        ("1 stick (1/2 cup) butter", "2 stick (1 cup) butter"),
+        ("2 cups (about 500 ml) stock", "4 cups (about 1000 ml) stock"),
+        # spellings the critique did not list
+        ("1 tsp. (5 ml) vanilla", "2 tsp. (10 ml) vanilla"),
+        ("2 sticks (1 cup) butter", "4 sticks (2 cup) butter"),
+        ("2 cups (approx. 480 ml) stock", "4 cups (approx. 960 ml) stock"),
+        ("1 pint (approximately 2 cups) cream", "2 pint (approximately 4 cups) cream"),
+        ("1 cup (~240 ml) milk", "2 cup (~480 ml) milk"),
+        ("2 cups / 480 ml milk", "4 cups / 960 ml milk"),
+        ("1 lb. 2 oz. (510 g) beef", "2 lb. 4 oz. (1020 g) beef"),
+        # brackets with no amount in them are just a note
+        ("1 cup (softened) butter", "2 cup (softened) butter"),
+    ],
+)
+def test_second_amounts_with_periods_sticks_and_about(ingredient, expected):
+    assert scale_ingredient(ingredient, Fraction(2)) == expected
+
+
+@pytest.mark.parametrize(
+    "ingredient",
+    [
+        "200 g (7,5 oz) butter",  # second amount only partly readable
+        "1 lb 2,5 oz beef",
+        "1 cup (2 large) carrots",  # second amount with an unknown unit
+        "1 cup (about 3 medium) apples",
+        "12 oz. (340 grms) chips",
+        "1 cup plus 2 pinches salt",
+        "2 cups/2 large",
+    ],
+)
+def test_unreadable_second_amount_leaves_whole_line_unchanged(ingredient):
+    assert scale_ingredient(ingredient, Fraction(2)) == ingredient
+
+
+@pytest.mark.parametrize(
+    "ingredient, expected",
+    [
+        ("2-inch piece ginger", "2-inch piece ginger"),  # documented limitation
+        ("2 cm ginger", "2 cm ginger"),
+        ("8-oz package cream cheese", "16-oz package cream cheese"),
+    ],
+)
+def test_leading_length_is_a_size_but_leading_weight_is_an_amount(ingredient, expected):
+    assert scale_ingredient(ingredient, Fraction(2)) == expected
+
+
+def test_scaled_endpoint_handles_round_3_inputs():
+    lines = ["1 8-oz package cream cheese", "2 15-ounce cans black beans",
+             "12 oz. (340 g) chocolate chips", "1 cup (2 sticks) butter",
+             "1 cup (2 large) carrots"]
+    rec = _create(ingredients=lines)
+    body = client.get(f"/recipes/{rec['id']}/scaled", params={"factor": 2}).json()
+    assert body["ingredients"] == [
+        "2 8-oz package cream cheese", "4 15-ounce cans black beans",
+        "24 oz. (680 g) chocolate chips", "2 cup (4 sticks) butter",
+        "1 cup (2 large) carrots",
+    ]

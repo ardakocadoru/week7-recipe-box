@@ -170,21 +170,36 @@ _CONTINUES = re.compile(
     rf"[\d.,/⁄{_VULGAR}] | (?: {_RANGE_SEPARATOR} | \s+ ) (?: [\d{_VULGAR}] | \.\d )",
     re.VERBOSE,
 )
-# Text right after a number that makes it an item size ("9-inch", '9"', "20 cm").
-_SIZE_SUFFIX = r"""(?: \s*-?\s* (?i: inch(?:es)? | cm | mm ) \b | \s* ["″] )"""
-_SIZE = re.compile(_SIZE_SUFFIX, re.VERBOSE)
-# A size between a count and the item: "1 9-inch pie crust".
-_SIZED_ITEM = re.compile(rf"\s+ {_NUMBER} {_SIZE_SUFFIX}", re.VERBOSE)
+# Units. Each may end with a period ("oz.", "tbsp."). Volume and weight units measure
+# an ingredient; length units only ever describe an item's size.
+_MEASURE_UNIT = r"""(?i: cups? | tablespoons? | tbsps? | tbs | teaspoons? | tsps?
+                       | pounds? | lbs? | ounces? | oz | fl \s? oz
+                       | kilograms? | kgs? | grams? | g | milligrams? | mg
+                       | millilit(?:er|re)s? | ml | lit(?:er|re)s? | l | dl | cl
+                       | pints? | pt | quarts? | qt | gallons? | gal | sticks? ) \b \.?"""
+_LENGTH_UNIT = r"""(?: (?i: (?: inch(?:es)? | cm | mm ) \b \.? | in\. ) | ["″] )"""
+_UNIT_AHEAD = re.compile(rf"\s* {_MEASURE_UNIT}", re.VERBOSE)
 
-_UNIT = r"""(?i: cups? | tablespoons? | tbsp | teaspoons? | tsp
-               | pounds? | lbs? | ounces? | oz | fl \s? oz
-               | kilograms? | kg | grams? | g | millilit(?:er|re)s? | ml
-               | lit(?:er|re)s? | l | dl | cl | pints? | quarts? ) \b"""
-_UNIT_AHEAD = re.compile(rf"\s* {_UNIT}", re.VERBOSE)
-# A unit and a connector that lead to a second quantity of the same ingredient:
-# "1 cup plus 2 tbsp", "1 lb 2 oz", "200 g (7 oz)", "200 g/7 oz".
-_SECOND_QUANTITY_LINK = re.compile(
-    rf"""\s* {_UNIT} (?: \s+(?i:plus)\s+ | \s*\(\s* | \s*/\s* | \s+ )
+# A leading length is an item size, not an amount: "9-inch pie crust", "20 cm tin".
+_SIZE = re.compile(rf"\s*-?\s* {_LENGTH_UNIT}", re.VERBOSE)
+# A pack or item size between a count and the item: "1 8-oz package",
+# "2 400 g tins", "2 14.5-ounce cans", "1 9-inch crust". The count is scaled, the
+# size is not.
+_PACK_SIZE = re.compile(
+    rf"\s+ {_NUMBER} \s*-?\s* (?: {_MEASURE_UNIT} | {_LENGTH_UNIT} )", re.VERBOSE
+)
+
+# A unit and a connector that lead to a second amount of the same ingredient:
+# "1 cup plus 2 tbsp", "1 lb 2 oz", "200 g (about 7 oz)", "200 g/7 oz".
+# A plain space is a weak link: "2 cups 2% milk" has no second amount, it just names
+# the ingredient. The others always introduce one.
+_SECOND_AMOUNT_LINK = re.compile(
+    rf"""\s* {_MEASURE_UNIT}
+         (?: (?P<strong> \s+ (?i:plus) \s+
+                       | \s* \( \s* (?: (?i: about | approx\.? | approximately | roughly
+                                            | around ) \s+ | ~ \s* )?
+                       | \s* / \s* )
+           | \s+ )
          (?= [\d{_VULGAR}] | \.\d )""",
     re.VERBOSE,
 )
@@ -239,7 +254,7 @@ def _read_amount(line: str, pos: int) -> re.Match | None:
     if amount is None:
         return None
     end = amount.end()
-    if _CONTINUES.match(line, end) and not _SIZED_ITEM.match(line, end):
+    if _CONTINUES.match(line, end) and not _PACK_SIZE.match(line, end):
         return None
     return amount
 
@@ -261,12 +276,27 @@ def _scale_amount(amount: re.Match, factor: Fraction) -> str | None:
 def scale_ingredient(ingredient: str, factor: Fraction) -> str:
     """Multiply the quantities of an ingredient line by factor.
 
-    Scaled: the leading amount (both ends of a range), and any second quantity that
-    follows a unit and is itself followed by a unit ("1 lb 2 oz", "200 g (7 oz)").
-    Not scaled: item sizes ("1 9-inch pie crust" scales only the 1; "9-inch pie
-    crust" is unchanged) and pack sizes ("3 x 200 g packs", "1 (14 oz) can").
-    A line whose quantity we cannot read in full ("salt to taste", "1,5 dl milk",
-    "1/0 cup") is returned unchanged, and so is every line when factor is 1.
+    Scaled:
+    - the leading amount, including both ends of a range ("2-3 eggs"). A leading
+      weight or volume is an amount even when hyphenated: "8-oz package" becomes
+      "16-oz package", the same total;
+    - second amounts of the same ingredient that follow the first amount's unit
+      via "plus", "(", "/" or a space and carry a unit of their own:
+      "1 cup plus 2 tbsp", "1 lb. 2 oz.", "12 oz. (340 g)", "2 cups (about 500 ml)".
+
+    Not scaled:
+    - a pack or item size after the count ("1 8-oz package", "2 400 g tins",
+      "1 9-inch crust"): only the count changes;
+    - pack sizes in brackets after a bare count ("1 (14 oz) can") or after "x"
+      ("3 x 200 g packs");
+    - a leading length ("9-inch pie crust", "20 cm tart tin"), which is read as an
+      item size. Limitation: this also leaves "2-inch piece ginger" and "2 cm
+      ginger" unchanged, although there the length is the amount to scale.
+
+    Returned unchanged: lines with no readable leading amount ("salt to taste",
+    "1,5 dl milk", "1/0 cup"); lines with a second amount that cannot be fully
+    read, or whose unit is not recognised ("200 g (7,5 oz)", "1 cup (2 large)"),
+    so a line is never half scaled; and every line when factor is 1.
     """
     if factor == 1:
         return ingredient
@@ -274,13 +304,15 @@ def scale_ingredient(ingredient: str, factor: Fraction) -> str:
     if first is None or _SIZE.match(ingredient, first.end()):
         return ingredient
     amounts = [first]
-    if not _SIZED_ITEM.match(ingredient, first.end()):
-        while link := _SECOND_QUANTITY_LINK.match(ingredient, amounts[-1].end()):
+    if not _PACK_SIZE.match(ingredient, first.end()):
+        while link := _SECOND_AMOUNT_LINK.match(ingredient, amounts[-1].end()):
             amount = _read_amount(ingredient, link.end())
             if amount is None:
-                return ingredient  # a second quantity we read only partly: "(7,5 oz)"
+                return ingredient  # second amount only partly readable: "(7,5 oz)"
             if not _UNIT_AHEAD.match(ingredient, amount.end()):
-                break  # not a quantity of this ingredient: "2 cups 2% milk"
+                if link["strong"] is not None:
+                    return ingredient  # unknown unit: "(2 large)"
+                break  # a number in the name, not an amount: "2 cups 2% milk"
             amounts.append(amount)
 
     parts, last = [], 0
