@@ -79,11 +79,41 @@ def test_scaled_unknown_recipe_404():
     assert r.status_code == 404
 
 
-@pytest.mark.parametrize("factor", ["0", "-2", "abc", "", "nan", "inf", "1/2"])
+@pytest.mark.parametrize(
+    "factor",
+    ["0", "-2", "abc", "", "nan", "inf", "1/2", "2,5", "0.0000001", "0.009", "100.5", "1e308"],
+)
 def test_scaled_rejects_bad_factor(factor):
     rec = _create()
     r = client.get(f"/recipes/{rec['id']}/scaled", params={"factor": factor})
     assert r.status_code == 422
+
+
+@pytest.mark.parametrize("factor, expected", [("0.01", "2 g flour"), ("100", "20000 g flour")])
+def test_scaled_accepts_factor_limits(factor, expected):
+    rec = _create(ingredients=["200 g flour"])
+    r = client.get(f"/recipes/{rec['id']}/scaled", params={"factor": factor})
+    assert r.status_code == 200
+    assert r.json()["ingredients"] == [expected]
+
+
+def test_scaled_factor_is_read_as_exact_decimal():
+    # 0.2 is not exact in binary; it must still act as exactly 1/5.
+    rec = _create(ingredients=["2 1/2 cups flour", "1/2 cup water"])
+    body = client.get(f"/recipes/{rec['id']}/scaled", params={"factor": 0.2}).json()
+    assert body["ingredients"] == ["1/2 cups flour", "0.1 cup water"]
+
+
+def test_scaled_endpoint_handles_critique_inputs():
+    lines = ["1½ cups flour", "1,5 dl milk", "1,000 g flour", "1 1/2-2 cups stock",
+             "2 - 3 eggs", "2–3 eggs", "2 to 3 eggs", "½ cup sugar"]
+    rec = _create(ingredients=lines)
+    body = client.get(f"/recipes/{rec['id']}/scaled", params={"factor": 2}).json()
+    assert body["ingredients"] == [
+        "3 cups flour", "1,5 dl milk", "1,000 g flour", "3-4 cups stock",
+        "4 - 6 eggs", "4–6 eggs", "4 to 6 eggs", "1 cup sugar",
+    ]
+    assert client.get(f"/recipes/{rec['id']}").json()["ingredients"] == lines
 
 
 def test_scaled_requires_factor():
@@ -124,8 +154,21 @@ def test_scaled_recipe_without_ingredients():
         ("2 1/4 cups flour", Fraction(1, 2), "1 1/8 cups flour"),
         # fractions whose result would be an awkward fraction fall back to decimals
         ("1/2 cup stock", Fraction(3, 10), "0.15 cup stock"),
-        # very small results keep significant digits instead of becoming "0"
+        ("1/2 cup water", Fraction(1, 5), "0.1 cup water"),
+        ("2/3 cup milk", Fraction(1, 3), "0.22 cup milk"),
+        # small results keep two significant digits, in fixed-point notation
+        ("1/16 tsp", Fraction(1, 2), "0.031 tsp"),
         ("1 g saffron", Fraction(1, 1000), "0.001 g saffron"),
+        ("1/16 tsp cayenne", Fraction(1, 1000), "0.000062 tsp cayenne"),
+        # Unicode fraction characters, alone or after a whole number
+        ("½ cup sugar", 2, "1 cup sugar"),
+        ("½ cup sugar", 3, "1 1/2 cup sugar"),
+        ("1½ cups flour", 2, "3 cups flour"),
+        ("1½ cups flour", Fraction(1, 2), "3/4 cups flour"),
+        ("1 ¼ cups oats", 2, "2 1/2 cups oats"),
+        ("⅓ cup oil", 3, "1 cup oil"),
+        ("¾ tsp cumin", Fraction(1, 5), "0.15 tsp cumin"),
+        ("1⁄2 cup rice", 3, "1 1/2 cup rice"),  # U+2044 fraction slash
     ],
 )
 def test_scale_ingredient_quantities(ingredient, factor, expected):
@@ -139,15 +182,56 @@ def test_scale_ingredient_quantities(ingredient, factor, expected):
         "a pinch of nutmeg",
         "",
         "   ",
-        "2-3 eggs",  # ranges are not understood, so left alone
         "1/0 cup water",  # zero denominator
         "1 1/0 cup water",
+        "1/0-2 cups water",
         "1.2.3 mystery",
         "1.5.",
+        # decimal commas and thousands separators: not guessed at
+        "1,5 dl milk",
+        "1,000 g flour",
+        # numbers that continue past what we read
+        "1 2 eggs",
+        "2-3-4 eggs",
+        "1/2½ cup",
+        "12345678901 g flour",
     ],
 )
 def test_scale_ingredient_leaves_unreadable_lines_unchanged(ingredient):
     assert scale_ingredient(ingredient, Fraction(2)) == ingredient
+
+
+@pytest.mark.parametrize("factor", [Fraction(2), Fraction(1, 2)])
+@pytest.mark.parametrize(
+    "ingredient", ["1½ cups flour", "1,5 dl milk", "1,000 g flour", "1 1/2-2 cups stock"]
+)
+def test_partly_readable_numbers_are_never_mangled(ingredient, factor):
+    # From the round-1 critique: x2 and x0.5 used to give e.g. "2½" or "0.5,5".
+    expected = {
+        ("1½ cups flour", 2): "3 cups flour",
+        ("1½ cups flour", Fraction(1, 2)): "3/4 cups flour",
+        ("1 1/2-2 cups stock", 2): "3-4 cups stock",
+        ("1 1/2-2 cups stock", Fraction(1, 2)): "3/4-1 cups stock",
+    }.get((ingredient, factor), ingredient)
+    assert scale_ingredient(ingredient, factor) == expected
+
+
+@pytest.mark.parametrize(
+    "ingredient, factor, expected",
+    [
+        ("2-3 eggs", 2, "4-6 eggs"),
+        ("2 - 3 eggs", 2, "4 - 6 eggs"),
+        ("2–3 eggs", 2, "4–6 eggs"),  # en dash
+        ("2 to 3 eggs", 2, "4 to 6 eggs"),
+        ("2 To 3 eggs", 2, "4 To 6 eggs"),
+        ("2 or 3 eggs", 2, "4 or 6 eggs"),
+        ("2 - 3 eggs", Fraction(1, 3), "0.67 - 1 eggs"),
+        ("1/2-1 cup milk", 2, "1-2 cup milk"),
+        ("1 1/2-2 cups stock", Fraction(1, 2), "3/4-1 cups stock"),
+    ],
+)
+def test_scale_ingredient_scales_both_ends_of_a_range(ingredient, factor, expected):
+    assert scale_ingredient(ingredient, Fraction(factor)) == expected
 
 
 def test_scale_ingredient_only_touches_leading_quantity():

@@ -13,6 +13,7 @@ Test:
 import json
 import re
 import sqlite3
+import unicodedata
 from contextlib import closing
 from fractions import Fraction
 from pathlib import Path
@@ -126,67 +127,106 @@ def toggle_favorite(recipe_id: int):
     return _row_to_recipe(row)
 
 
-# A leading quantity: mixed number ("1 1/2"), fraction ("1/2"), decimal ("1.5") or
-# integer ("200"). The lookahead stops partial matches such as "2" in "2-3 eggs" or
-# "1" in "1/0 cup", so anything we cannot read fully is left untouched.
-_QUANTITY = re.compile(
-    r"^(?P<lead>\s*)"
-    r"(?:(?P<whole>\d{1,9})\s+(?P<num>\d{1,9})/(?P<den>\d{1,9})"
-    r"|(?P<frac_num>\d{1,9})/(?P<frac_den>\d{1,9})"
-    r"|(?P<number>\d{1,9}(?:\.\d{1,9})?))"
-    r"(?![\d./-])"
+# --- Ingredient scaling --------------------------------------------------------
+
+MIN_FACTOR = 0.01
+MAX_FACTOR = 100
+
+# Single-character fractions such as "½", mapped to their exact values.
+_UNICODE_FRACTIONS = {
+    ch: Fraction(unicodedata.numeric(ch)).limit_denominator(10)
+    for ch in "¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞"
+}
+_VULGAR = "".join(_UNICODE_FRACTIONS)
+
+# Denominators people actually measure with; other fractions are shown as decimals.
+_KITCHEN_DENOMINATORS = {2, 3, 4, 8, 16}
+
+# One number. Digit runs are capped at 9 so int() never sees an absurdly long string.
+_NUMBER = rf"""
+      \d{{1,9}} \s+ \d{{1,9}} [/⁄] \d{{1,9}}   # mixed number: 1 1/2
+    | \d{{1,9}} \s* [{_VULGAR}]                # whole plus fraction character: 1½
+    | [{_VULGAR}]                              # fraction character: ½
+    | \d{{1,9}} [/⁄] \d{{1,9}}                 # fraction: 1/2
+    | \d{{1,9}} (?: \. \d{{1,9}} )?            # integer or decimal: 200, 1.5
+"""
+_RANGE_SEPARATOR = r"\s*[-–—]\s* | \s+(?i:to|or)\s+"
+
+# A leading amount: one number or a range ("2-3", "2 - 3", "2–3", "2 to 3").
+# The final lookahead rejects a match that is followed by more of a number
+# ("1,5", "1,000", "1.2.3", "2-3-4", "1 2"), so a number we only partly read
+# never gets scaled; the line is returned unchanged instead.
+_AMOUNT = re.compile(
+    rf"""
+    ^ (?P<lead> \s* )
+    (?P<low> {_NUMBER} )
+    (?: (?P<sep> {_RANGE_SEPARATOR} ) (?P<high> {_NUMBER} ) )?
+    (?! [\d.,/⁄{_VULGAR}] | (?: {_RANGE_SEPARATOR} | \s+ ) [\d{_VULGAR}] )
+    """,
+    re.VERBOSE,
 )
 
 
-def _parse_quantity(match: re.Match) -> tuple[Fraction, bool] | None:
-    """Return (value, written_as_fraction), or None for a zero denominator."""
-    if match["number"] is not None:
-        return Fraction(match["number"]), False
-    if match["whole"] is not None:
-        whole, num, den = int(match["whole"]), int(match["num"]), int(match["den"])
-    else:
-        whole, num, den = 0, int(match["frac_num"]), int(match["frac_den"])
+def _parse_number(text: str) -> tuple[Fraction, bool] | None:
+    """Return (value, written_as_fraction) for a _NUMBER match.
+
+    Returns None for a zero denominator such as "1/0".
+    """
+    text = text.replace("⁄", "/")
+    if text[-1] in _UNICODE_FRACTIONS:
+        whole = text[:-1].strip()
+        return int(whole or 0) + _UNICODE_FRACTIONS[text[-1]], True
+    if "/" not in text:
+        return Fraction(text), False
+    whole, _, frac = text.rpartition(" ")
+    num, den = (int(part) for part in frac.split("/"))
     if den == 0:
         return None
-    return whole + Fraction(num, den), True
+    return int(whole or 0) + Fraction(num, den), True
+
+
+def _format_decimal(value: Fraction) -> str:
+    """Fixed-point text: two decimals, more for small values ("0.031", not "0.03")."""
+    places = 2
+    while round(value * 10**places) < 10:  # keep at least two significant digits
+        places += 1
+    whole, rest = divmod(round(value * 10**places), 10**places)
+    return f"{whole}.{rest:0{places}d}".rstrip("0").rstrip(".")
 
 
 def _format_quantity(value: Fraction, as_fraction: bool) -> str:
     """Readable quantity: "400", "1 1/2" (for fraction inputs) or "2.25"."""
     if value.denominator == 1:
         return str(value.numerator)
-    if as_fraction and value.denominator <= 16:
+    if as_fraction and value.denominator in _KITCHEN_DENOMINATORS:
         whole, rest = divmod(value.numerator, value.denominator)
         frac = f"{rest}/{value.denominator}"
         return f"{whole} {frac}" if whole else frac
-    # Round to two decimals with exact integer arithmetic (no float overflow or noise).
-    whole, cents = divmod(round(value * 100), 100)
-    if whole == 0 and cents == 0:
-        # Would round to "0"; keep a few significant digits instead.
-        return f"{float(value):.3g}"
-    return f"{whole}.{cents:02d}".rstrip("0").rstrip(".")
+    return _format_decimal(value)
 
 
 def scale_ingredient(ingredient: str, factor: Fraction) -> str:
-    """Multiply the leading quantity of an ingredient line by factor.
+    """Multiply the leading amount of an ingredient line by factor.
 
-    Lines without a readable leading quantity ("salt to taste") are returned as is.
+    Both ends of a range are scaled. A line whose start is not a number we can read
+    in full ("salt to taste", "1,5 dl milk", "1/0 cup") is returned unchanged.
     """
-    match = _QUANTITY.match(ingredient)
+    match = _AMOUNT.match(ingredient)
     if match is None:
         return ingredient
-    parsed = _parse_quantity(match)
-    if parsed is None:
+    ends = [match["low"]] + ([match["high"]] if match["high"] else [])
+    parsed = [_parse_number(end) for end in ends]
+    if None in parsed:
         return ingredient
-    value, as_fraction = parsed
-    scaled = _format_quantity(value * factor, as_fraction)
-    return match["lead"] + scaled + ingredient[match.end():]
+    scaled = [_format_quantity(value * factor, as_fraction) for value, as_fraction in parsed]
+    amount = (match["sep"] or "").join(scaled)
+    return match["lead"] + amount + ingredient[match.end():]
 
 
 @app.get("/recipes/{recipe_id}/scaled")
 def get_scaled_recipe(
     recipe_id: int,
-    factor: float = Query(gt=0, allow_inf_nan=False),
+    factor: float = Query(ge=MIN_FACTOR, le=MAX_FACTOR, allow_inf_nan=False),
 ):
     recipe = get_recipe(recipe_id)
     # repr() gives the shortest decimal for the float, so 0.1 becomes exactly 1/10.
