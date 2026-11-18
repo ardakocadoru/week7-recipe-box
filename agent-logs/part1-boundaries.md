@@ -1,9 +1,9 @@
 # Part I: the brief each agent received
 
-Both agents were started at 2026-11-18 10:41:50 (+03), each in its own git worktree, and ran
-at the same time. They could edit files and run tests inside their own worktree and commit
-on their own branch. They could not merge, rebase, push, change git config, or touch the
-other worktree. Merging was my job.
+Both agents were launched in the same step on 2026-11-18 at about 10:42 (+03), each in its
+own git worktree, and ran at the same time. They could edit files and run tests inside their
+own worktree and commit on their own branch. They could not merge, rebase, push, change git
+config, or touch the other worktree. Merging was my job.
 
 | | Agent A | Agent B |
 |---|---|---|

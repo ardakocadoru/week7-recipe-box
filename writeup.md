@@ -32,8 +32,8 @@ git worktree add ../recipe-task-a -b task-a   # Agent A: tag filter
 git worktree add ../recipe-task-b -b task-b   # Agent B: favorites
 ```
 
-Both agents were started at 10:41:50. Their own start and end times, and their commit times,
-show that they ran at the same time:
+I launched both agents in the same step, right after creating the worktrees. Their own start
+and end times, and their commit times, show that they ran at the same time:
 
 | | Started | Committed | Commit |
 |---|---|---|---|
