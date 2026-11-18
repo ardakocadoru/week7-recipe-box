@@ -11,6 +11,7 @@ Test:
     pytest
 """
 import json
+import math
 import re
 import sqlite3
 import unicodedata
@@ -128,6 +129,9 @@ def toggle_favorite(recipe_id: int):
 
 
 # --- Ingredient scaling --------------------------------------------------------
+#
+# Known limitation: units are not re-inflected, so "1 cup" x2 gives "2 cup" and
+# "2 eggs" x0.5 gives "1 eggs".
 
 MIN_FACTOR = 0.01
 MAX_FACTOR = 100
@@ -144,25 +148,44 @@ _KITCHEN_DENOMINATORS = {2, 3, 4, 8, 16}
 
 # One number. Digit runs are capped at 9 so int() never sees an absurdly long string.
 _NUMBER = rf"""
-      \d{{1,9}} \s+ \d{{1,9}} [/⁄] \d{{1,9}}   # mixed number: 1 1/2
-    | \d{{1,9}} \s* [{_VULGAR}]                # whole plus fraction character: 1½
-    | [{_VULGAR}]                              # fraction character: ½
-    | \d{{1,9}} [/⁄] \d{{1,9}}                 # fraction: 1/2
-    | \d{{1,9}} (?: \. \d{{1,9}} )?            # integer or decimal: 200, 1.5
+    (?: \d{{1,9}} \s+ \d{{1,9}} [/⁄] \d{{1,9}}   # mixed number: 1 1/2
+      | \d{{1,9}} - \d{{1,9}} [/⁄] \d{{1,9}}     # hyphenated mixed number: 1-1/2
+      | \d{{1,9}} (?: \s* | - ) [{_VULGAR}]      # whole plus fraction character: 1½, 1-½
+      | [{_VULGAR}]                              # fraction character: ½
+      | \d{{1,9}} [/⁄] \d{{1,9}}                 # fraction: 1/2
+      | \d{{0,9}} \. \d{{1,9}}                   # decimal: 1.5, .5
+      | \d{{1,9}}                                # integer: 200
+    )
 """
-_RANGE_SEPARATOR = r"\s*[-–—]\s* | \s+(?i:to|or)\s+"
+_RANGE_SEPARATOR = r"(?: \s*[-–—]\s* | \s+(?i:to|or)\s+ )"
 
-# A leading amount: one number or a range ("2-3", "2 - 3", "2–3", "2 to 3").
-# The final lookahead rejects a match that is followed by more of a number
-# ("1,5", "1,000", "1.2.3", "2-3-4", "1 2"), so a number we only partly read
-# never gets scaled; the line is returned unchanged instead.
+# An amount: one number or a range ("2-3", "2 - 3", "2–3", "2 to 3").
 _AMOUNT = re.compile(
-    rf"""
-    ^ (?P<lead> \s* )
-    (?P<low> {_NUMBER} )
-    (?: (?P<sep> {_RANGE_SEPARATOR} ) (?P<high> {_NUMBER} ) )?
-    (?! [\d.,/⁄{_VULGAR}] | (?: {_RANGE_SEPARATOR} | \s+ ) [\d{_VULGAR}] )
-    """,
+    rf"(?P<low> {_NUMBER} ) (?: (?P<sep> {_RANGE_SEPARATOR} ) (?P<high> {_NUMBER} ) )?",
+    re.VERBOSE,
+)
+# Text right after an amount that means the number goes on ("1,5", "1,000", "2-3-4",
+# "1 2"): we read it only partly, so the line must not be scaled.
+_CONTINUES = re.compile(
+    rf"[\d.,/⁄{_VULGAR}] | (?: {_RANGE_SEPARATOR} | \s+ ) (?: [\d{_VULGAR}] | \.\d )",
+    re.VERBOSE,
+)
+# Text right after a number that makes it an item size ("9-inch", '9"', "20 cm").
+_SIZE_SUFFIX = r"""(?: \s*-?\s* (?i: inch(?:es)? | cm | mm ) \b | \s* ["″] )"""
+_SIZE = re.compile(_SIZE_SUFFIX, re.VERBOSE)
+# A size between a count and the item: "1 9-inch pie crust".
+_SIZED_ITEM = re.compile(rf"\s+ {_NUMBER} {_SIZE_SUFFIX}", re.VERBOSE)
+
+_UNIT = r"""(?i: cups? | tablespoons? | tbsp | teaspoons? | tsp
+               | pounds? | lbs? | ounces? | oz | fl \s? oz
+               | kilograms? | kg | grams? | g | millilit(?:er|re)s? | ml
+               | lit(?:er|re)s? | l | dl | cl | pints? | quarts? ) \b"""
+_UNIT_AHEAD = re.compile(rf"\s* {_UNIT}", re.VERBOSE)
+# A unit and a connector that lead to a second quantity of the same ingredient:
+# "1 cup plus 2 tbsp", "1 lb 2 oz", "200 g (7 oz)", "200 g/7 oz".
+_SECOND_QUANTITY_LINK = re.compile(
+    rf"""\s* {_UNIT} (?: \s+(?i:plus)\s+ | \s*\(\s* | \s*/\s* | \s+ )
+         (?= [\d{_VULGAR}] | \.\d )""",
     re.VERBOSE,
 )
 
@@ -170,27 +193,32 @@ _AMOUNT = re.compile(
 def _parse_number(text: str) -> tuple[Fraction, bool] | None:
     """Return (value, written_as_fraction) for a _NUMBER match.
 
-    Returns None for a zero denominator such as "1/0".
+    Returns None for a zero denominator ("1/0") or a mixed number whose fraction is
+    not proper ("1-3/2"), since neither has one clear meaning.
     """
     text = text.replace("⁄", "/")
-    if text[-1] in _UNICODE_FRACTIONS:
-        whole = text[:-1].strip()
-        return int(whole or 0) + _UNICODE_FRACTIONS[text[-1]], True
-    if "/" not in text:
+    frac = re.search(rf"(\d+)/(\d+)$|[{_VULGAR}]$", text)
+    if frac is None:
         return Fraction(text), False
-    whole, _, frac = text.rpartition(" ")
-    num, den = (int(part) for part in frac.split("/"))
-    if den == 0:
+    whole = int(text[: frac.start()].strip().rstrip("-") or 0)
+    if frac[0] in _UNICODE_FRACTIONS:
+        return whole + _UNICODE_FRACTIONS[frac[0]], True
+    num, den = int(frac[1]), int(frac[2])
+    if den == 0 or (whole and num >= den):
         return None
-    return int(whole or 0) + Fraction(num, den), True
+    return whole + Fraction(num, den), True
+
+
+def _round_half_up(value: Fraction) -> int:
+    return math.floor(value + Fraction(1, 2))
 
 
 def _format_decimal(value: Fraction) -> str:
     """Fixed-point text: two decimals, more for small values ("0.031", not "0.03")."""
     places = 2
-    while round(value * 10**places) < 10:  # keep at least two significant digits
+    while _round_half_up(value * 10**places) < 10:  # keep two significant digits
         places += 1
-    whole, rest = divmod(round(value * 10**places), 10**places)
+    whole, rest = divmod(_round_half_up(value * 10**places), 10**places)
     return f"{whole}.{rest:0{places}d}".rstrip("0").rstrip(".")
 
 
@@ -205,22 +233,64 @@ def _format_quantity(value: Fraction, as_fraction: bool) -> str:
     return _format_decimal(value)
 
 
-def scale_ingredient(ingredient: str, factor: Fraction) -> str:
-    """Multiply the leading amount of an ingredient line by factor.
+def _read_amount(line: str, pos: int) -> re.Match | None:
+    """The amount starting at pos, or None if there is none or it is only partly read."""
+    amount = _AMOUNT.match(line, pos)
+    if amount is None:
+        return None
+    end = amount.end()
+    if _CONTINUES.match(line, end) and not _SIZED_ITEM.match(line, end):
+        return None
+    return amount
 
-    Both ends of a range are scaled. A line whose start is not a number we can read
-    in full ("salt to taste", "1,5 dl milk", "1/0 cup") is returned unchanged.
+
+def _scale_amount(amount: re.Match, factor: Fraction) -> str | None:
+    """Scaled text for an amount, or None if it cannot be read safely."""
+    ends = [_parse_number(amount["low"])]
+    if amount["high"]:
+        ends.append(_parse_number(amount["high"]))
+    if None in ends:
+        return None
+    if len(ends) == 2 and ends[1][0] < ends[0][0]:
+        return None  # a descending "range" such as "1 - 1/2" is not a real range
+    return (amount["sep"] or "").join(
+        _format_quantity(value * factor, as_fraction) for value, as_fraction in ends
+    )
+
+
+def scale_ingredient(ingredient: str, factor: Fraction) -> str:
+    """Multiply the quantities of an ingredient line by factor.
+
+    Scaled: the leading amount (both ends of a range), and any second quantity that
+    follows a unit and is itself followed by a unit ("1 lb 2 oz", "200 g (7 oz)").
+    Not scaled: item sizes ("1 9-inch pie crust" scales only the 1; "9-inch pie
+    crust" is unchanged) and pack sizes ("3 x 200 g packs", "1 (14 oz) can").
+    A line whose quantity we cannot read in full ("salt to taste", "1,5 dl milk",
+    "1/0 cup") is returned unchanged, and so is every line when factor is 1.
     """
-    match = _AMOUNT.match(ingredient)
-    if match is None:
+    if factor == 1:
         return ingredient
-    ends = [match["low"]] + ([match["high"]] if match["high"] else [])
-    parsed = [_parse_number(end) for end in ends]
-    if None in parsed:
+    first = _read_amount(ingredient, len(ingredient) - len(ingredient.lstrip()))
+    if first is None or _SIZE.match(ingredient, first.end()):
         return ingredient
-    scaled = [_format_quantity(value * factor, as_fraction) for value, as_fraction in parsed]
-    amount = (match["sep"] or "").join(scaled)
-    return match["lead"] + amount + ingredient[match.end():]
+    amounts = [first]
+    if not _SIZED_ITEM.match(ingredient, first.end()):
+        while link := _SECOND_QUANTITY_LINK.match(ingredient, amounts[-1].end()):
+            amount = _read_amount(ingredient, link.end())
+            if amount is None:
+                return ingredient  # a second quantity we read only partly: "(7,5 oz)"
+            if not _UNIT_AHEAD.match(ingredient, amount.end()):
+                break  # not a quantity of this ingredient: "2 cups 2% milk"
+            amounts.append(amount)
+
+    parts, last = [], 0
+    for amount in amounts:
+        scaled = _scale_amount(amount, factor)
+        if scaled is None:
+            return ingredient
+        parts += [ingredient[last : amount.start()], scaled]
+        last = amount.end()
+    return "".join(parts) + ingredient[last:]
 
 
 @app.get("/recipes/{recipe_id}/scaled")

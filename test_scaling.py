@@ -159,7 +159,7 @@ def test_scaled_recipe_without_ingredients():
         # small results keep two significant digits, in fixed-point notation
         ("1/16 tsp", Fraction(1, 2), "0.031 tsp"),
         ("1 g saffron", Fraction(1, 1000), "0.001 g saffron"),
-        ("1/16 tsp cayenne", Fraction(1, 1000), "0.000062 tsp cayenne"),
+        ("1/16 tsp cayenne", Fraction(1, 1000), "0.000063 tsp cayenne"),  # half up
         # Unicode fraction characters, alone or after a whole number
         ("½ cup sugar", 2, "1 cup sugar"),
         ("½ cup sugar", 3, "1 1/2 cup sugar"),
@@ -234,8 +234,126 @@ def test_scale_ingredient_scales_both_ends_of_a_range(ingredient, factor, expect
     assert scale_ingredient(ingredient, Fraction(factor)) == expected
 
 
-def test_scale_ingredient_only_touches_leading_quantity():
-    assert scale_ingredient("2 eggs, beaten for 5 minutes", Fraction(2)) == (
-        "4 eggs, beaten for 5 minutes"
-    )
-    assert scale_ingredient("eggs: 2", Fraction(2)) == "eggs: 2"
+@pytest.mark.parametrize(
+    "ingredient, expected",
+    [
+        ("2 eggs, beaten for 5 minutes", "4 eggs, beaten for 5 minutes"),
+        ("eggs: 2", "eggs: 2"),
+        ("2 cups 2% milk", "4 cups 2% milk"),
+        ("1 lb 2 eggs", "2 lb 2 eggs"),
+        # pack sizes are part of the item, not an amount to scale
+        ("1 (14 oz) can tomatoes", "2 (14 oz) can tomatoes"),
+        ("3 x 200 g packs", "6 x 200 g packs"),
+    ],
+)
+def test_scale_ingredient_leaves_other_numbers_alone(ingredient, expected):
+    assert scale_ingredient(ingredient, Fraction(2)) == expected
+
+
+# --- round-2 critique ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "ingredient, factor, expected",
+    [
+        ("1-1/2 cups flour", 2, "3 cups flour"),
+        ("1-1/2 cups flour", 3, "4 1/2 cups flour"),
+        ("1-1/2 cups flour", Fraction(1, 2), "3/4 cups flour"),
+        ("1-1/2 cups flour", 100, "150 cups flour"),
+        ("1-½ cups", 3, "4 1/2 cups"),
+        ("2-1/4 cups", 2, "4 1/2 cups"),
+        ("1-1/2-2 cups stock", 2, "3-4 cups stock"),
+    ],
+)
+def test_hyphenated_mixed_numbers(ingredient, factor, expected):
+    assert scale_ingredient(ingredient, Fraction(factor)) == expected
+
+
+@pytest.mark.parametrize(
+    "ingredient, expected",
+    [
+        # true ranges keep working
+        ("2-3 eggs", "4-6 eggs"),
+        ("1/2-1 cup milk", "1-2 cup milk"),
+        ("1 1/2-2 cups stock", "3-4 cups stock"),
+        # ambiguous: improper fraction after the hyphen, or a descending "range"
+        ("1-3/2 cups", "1-3/2 cups"),
+        ("1 - 1/2 cups", "1 - 1/2 cups"),
+        ("3 to 2 eggs", "3 to 2 eggs"),
+    ],
+)
+def test_hyphen_ranges_versus_mixed_numbers(ingredient, expected):
+    assert scale_ingredient(ingredient, Fraction(2)) == expected
+
+
+@pytest.mark.parametrize(
+    "ingredient, factor, expected",
+    [
+        (".5 cup milk", 2, "1 cup milk"),
+        (".75 cup sugar", 2, "1.5 cup sugar"),
+        (".25 tsp salt", 2, "0.5 tsp salt"),
+        (".5 cup milk", 3, "1.5 cup milk"),
+        (".5-1 cup water", 2, "1-2 cup water"),
+    ],
+)
+def test_leading_dot_decimals(ingredient, factor, expected):
+    assert scale_ingredient(ingredient, Fraction(factor)) == expected
+
+
+@pytest.mark.parametrize(
+    "ingredient, expected",
+    [
+        ("1 cup plus 2 tablespoons flour", "2 cup plus 4 tablespoons flour"),
+        ("1 lb 2 oz beef", "2 lb 4 oz beef"),
+        ("200 g (7 oz) butter", "400 g (14 oz) butter"),
+        ("200 g/7 oz butter", "400 g/14 oz butter"),
+        ("1 cup (240 ml) milk", "2 cup (480 ml) milk"),
+        ("200g/7oz butter", "400g/14oz butter"),
+        ("2-3 cups (480-720 ml) stock", "4-6 cups (960-1440 ml) stock"),
+        # a second quantity we can read only partly leaves the whole line alone
+        ("200 g (7,5 oz) butter", "200 g (7,5 oz) butter"),
+    ],
+)
+def test_second_quantities_are_scaled(ingredient, expected):
+    assert scale_ingredient(ingredient, Fraction(2)) == expected
+
+
+@pytest.mark.parametrize(
+    "ingredient, expected",
+    [
+        ("9-inch pie crust", "9-inch pie crust"),
+        ("1 9-inch pie crust", "2 9-inch pie crust"),
+        ('1 9" pie crust', '2 9" pie crust'),
+        ("1 9 inch pie crust", "2 9 inch pie crust"),
+        ("1 20 cm tart tin", "2 20 cm tart tin"),
+        ("20 cm tart tin", "20 cm tart tin"),
+        # a leading size is never scaled, even when it measures the ingredient
+        ("2-inch piece ginger", "2-inch piece ginger"),
+    ],
+)
+def test_sizes_are_not_scaled(ingredient, expected):
+    assert scale_ingredient(ingredient, Fraction(2)) == expected
+
+
+def test_decimals_round_half_up():
+    assert scale_ingredient("0.025 g yeast", Fraction(5)) == "0.13 g yeast"
+    assert scale_ingredient("0.075 g yeast", Fraction(5)) == "0.38 g yeast"
+    assert scale_ingredient("1.0025 g salt", Fraction(2)) == "2.01 g salt"
+
+
+@pytest.mark.parametrize("ingredient", ["1.005 g salt", "0.125 g yeast", "1 3/2 cups", "2 cup"])
+def test_factor_one_returns_line_unchanged(ingredient):
+    assert scale_ingredient(ingredient, Fraction(1)) == ingredient
+
+
+def test_scaled_endpoint_handles_round_2_inputs():
+    lines = ["1-1/2 cups flour", ".5 cup milk", "1 lb 2 oz beef", "200 g (7 oz) butter",
+             "1 9-inch pie crust", "9-inch pie crust", "1.005 g salt"]
+    rec = _create(ingredients=lines)
+    body = client.get(f"/recipes/{rec['id']}/scaled", params={"factor": 2}).json()
+    assert body["ingredients"] == [
+        "3 cups flour", "1 cup milk", "2 lb 4 oz beef", "400 g (14 oz) butter",
+        "2 9-inch pie crust", "9-inch pie crust", "2.01 g salt",
+    ]
+    same = client.get(f"/recipes/{rec['id']}/scaled", params={"factor": 1}).json()
+    assert same["ingredients"] == lines
